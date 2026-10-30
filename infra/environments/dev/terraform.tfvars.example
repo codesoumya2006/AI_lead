@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars after creating a dedicated non-production GCP project.
+project_id                  = "replace-with-dev-project-id"
+project_number              = "replace-with-dev-project-number"
+billing_account_id          = ""
+region                      = "europe-west2"
+environment                 = "dev"
+state_bucket_name           = "replace-with-globally-unique-dev-state-bucket"
+api_image_digest            = ""
+web_image_digest            = ""
+enable_service_deployments  = false
+oidc_audience               = ""
+frontend_origin             = ""
+monthly_budget_usd          = 200
+notification_channels       = []

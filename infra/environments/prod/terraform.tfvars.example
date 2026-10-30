@@ -1,0 +1,14 @@
+# Intentionally not deployable as-is. Require security owner approval, populated values and reviewed plan.
+project_id                  = "replace-with-production-project-id"
+project_number              = "replace-with-production-project-number"
+billing_account_id          = ""
+region                      = "europe-west2"
+environment                 = "prod"
+state_bucket_name           = "replace-with-globally-unique-production-state-bucket"
+api_image_digest            = ""
+web_image_digest            = ""
+enable_service_deployments  = false
+oidc_audience               = ""
+frontend_origin             = ""
+monthly_budget_usd          = 200
+notification_channels       = []

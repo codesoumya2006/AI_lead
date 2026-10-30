@@ -1,0 +1,70 @@
+name: CI and security checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt ruff pip-audit
+        working-directory: backend
+      - run: ruff check app tests
+        working-directory: backend
+      - run: pytest -q
+        working-directory: backend
+      - run: pip-audit -r requirements.txt
+        working-directory: backend
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - run: npm audit --omit=dev --audit-level=high
+        working-directory: frontend
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+      - run: terraform fmt -check -recursive
+        working-directory: infra/terraform
+      - run: terraform init -backend=false
+        working-directory: infra/terraform
+      - run: terraform validate
+        working-directory: infra/terraform
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          tags: lead-to-order-api:ci
+          load: true
+      - uses: anchore/sbom-action@v0
+        with:
+          image: lead-to-order-api:ci
+          artifact-name: api-sbom.spdx.json
+          output-file: ./api-sbom.spdx.json
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: lead-to-order-api:ci
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
