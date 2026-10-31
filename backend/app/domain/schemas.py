@@ -54,6 +54,8 @@ class Qualification(BaseModel):
     location: str | None = None
     quantity: int | None = Field(default=None, ge=1, le=10000)
     equipment: list[str] = Field(default_factory=list)
+    area: str | None = Field(default=None, max_length=80)
+    frequency: str | None = Field(default=None, max_length=80)
     requested_time: str | None = None
     urgency: str = "normal"
     missing_fields: list[str] = Field(default_factory=list)
@@ -82,11 +84,29 @@ class LeadRecord(BaseModel):
     customer_email: str | None = None
     status: LeadStatus = LeadStatus.NEW
     qualification: Qualification | None = None
+    reviewed_qualification: Qualification | None = None
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
+    reviewed_fields: list[str] = Field(default_factory=list)
+    policy_eligible: bool | None = None
+    policy_reasons: list[str] = Field(default_factory=list)
     quote_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
     generation: int = 0
     history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class LeadReviewSubmission(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_generation: int = Field(ge=0)
+    service_type: str | None = Field(default=None, max_length=80)
+    location: str | None = Field(default=None, max_length=160)
+    quantity: int | None = Field(default=None, ge=1, le=10000)
+    area: str | None = Field(default=None, max_length=80)
+    frequency: str | None = Field(default=None, max_length=80)
+    requested_time: str | None = Field(default=None, max_length=160)
+
 
 class QuoteLineItem(BaseModel):
     service_code: str = Field(min_length=1, max_length=80)

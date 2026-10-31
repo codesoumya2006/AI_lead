@@ -3,13 +3,18 @@ from app.domain.schemas import Qualification, QuoteCreate, QuoteRecord, TenantSe
 
 class PolicyError(ValueError): pass
 
-def evaluate_qualification(q: Qualification, settings: TenantSettings) -> tuple[bool, list[str]]:
+def evaluate_qualification(
+    q: Qualification,
+    settings: TenantSettings,
+    *,
+    human_reviewed: bool = False,
+) -> tuple[bool, list[str]]:
     reasons = []
     if not q.service_type or q.service_type not in settings.allowed_services: reasons.append("service_not_configured_or_unknown")
     if not q.location or q.location not in settings.territories: reasons.append("location_missing_or_out_of_territory")
     if not q.quantity: reasons.append("quantity_missing")
     if q.missing_fields: reasons.append("required_fields_missing")
-    if q.confidence < 0.70: reasons.append("low_confidence_human_review_required")
+    if q.confidence < 0.70 and not human_reviewed: reasons.append("low_confidence_human_review_required")
     if q.injection_detected: reasons.append("possible_prompt_injection_human_review_required")
     if q.safety_flags: reasons.append("safety_flags_require_review")
     return not reasons, reasons

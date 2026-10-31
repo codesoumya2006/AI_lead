@@ -78,11 +78,203 @@ def test_quote_approval_then_send_is_sandbox_only(client):
     assert sent.status_code==200
     assert sent.json()['status']=='sandbox_recorded_not_delivered'
 
+
+def test_quote_approval_must_match_authenticated_actor(client):
+    lead_id=create(client,idem='approval-actor-key-001').json()['lead_id']
+    client.post(f'/v1/leads/{lead_id}/qualify',headers=H)
+    quote=client.post(
+        f'/v1/leads/{lead_id}/quotes',
+        headers=H,
+        json={
+            'catalogue_version':'catalogue-v1',
+            'line_items':[{
+                'service_code':'boiler_service',
+                'description':'Boiler service',
+                'quantity':3,
+                'unit_price':150,
+            }],
+        },
+    ).json()
+
+    response=client.post(
+        f"/v1/quotes/{quote['id']}/approve",
+        headers=H,
+        json={'expected_generation':quote['generation'],'reviewer_id':'claimed-reviewer'},
+    )
+
+    assert response.status_code==403
+
+
+def test_quote_send_must_match_authenticated_approver(client):
+    lead_id=create(client,idem='send-actor-key-001').json()['lead_id']
+    client.post(f'/v1/leads/{lead_id}/qualify',headers=H)
+    quote=client.post(
+        f'/v1/leads/{lead_id}/quotes',
+        headers=H,
+        json={
+            'catalogue_version':'catalogue-v1',
+            'line_items':[{
+                'service_code':'boiler_service',
+                'description':'Boiler service',
+                'quantity':3,
+                'unit_price':150,
+            }],
+        },
+    ).json()
+    approved=client.post(
+        f"/v1/quotes/{quote['id']}/approve",
+        headers=H,
+        json={'expected_generation':quote['generation'],'reviewer_id':'tester'},
+    )
+    assert approved.status_code==200
+
+    other_actor={**H,'X-Actor-ID':'different-reviewer'}
+    response=client.post(
+        f"/v1/quotes/{quote['id']}/send",
+        headers=other_actor,
+        json={'channel':'website','approved_by':'tester'},
+    )
+
+    assert response.status_code==403
+
+
+def test_human_review_preserves_ai_result_and_requires_policy_evaluation(client):
+    lead_id=create(
+        client,
+        message='We need a boiler service in Manchester for 3 units.',
+        idem='human-review-key-001',
+    ).json()['lead_id']
+    client.post(f'/v1/leads/{lead_id}/qualify',headers=H)
+    original=client.get(f'/v1/leads/{lead_id}',headers=H).json()['lead']
+    assert original['qualification']['quantity']==3
+    assert original['qualification']['confidence']<0.70
+    assert original['status']=='needs_information'
+
+    review_payload={
+        'expected_generation':original['generation'],
+        'service_type':'boiler_service',
+        'location':'Manchester',
+        'quantity':2,
+        'requested_time':'next week',
+    }
+    stale=client.post(
+        f'/v1/leads/{lead_id}/review',headers=H,
+        json=review_payload|{'expected_generation':original['generation']+1},
+    )
+    assert stale.status_code==409
+
+    saved=client.post(f'/v1/leads/{lead_id}/review',headers=H,json=review_payload)
+    assert saved.status_code==200, saved.text
+    reviewed=saved.json()['lead']
+    assert reviewed['qualification']['quantity']==3
+    assert reviewed['reviewed_qualification']['quantity']==2
+    assert reviewed['reviewed_qualification']['model_used']=='human_review'
+    assert reviewed['reviewed_by']=='tester'
+    assert reviewed['reviewed_fields']==['quantity','requested_time']
+    assert reviewed['message']=='We need a boiler service in Manchester for 3 units.'
+    assert reviewed['status']=='needs_information'
+    assert reviewed['policy_eligible'] is None
+
+    evaluation=client.post(f'/v1/leads/{lead_id}/policy/evaluate',headers=H)
+    assert evaluation.status_code==200, evaluation.text
+    assert evaluation.json()['eligible'] is True
+    assert evaluation.json()['lead']['status']=='qualified'
+
+    quote=client.post(
+        f'/v1/leads/{lead_id}/quotes',
+        headers=H,
+        json={
+            'catalogue_version':'catalogue-v1',
+            'line_items':[{
+                'service_code':'boiler_service',
+                'description':'Boiler service',
+                'quantity':2,
+                'unit_price':150,
+            }],
+        },
+    )
+    assert quote.status_code==201, quote.text
+    assert quote.json()['subtotal']==300
+    actions=[event['action'] for event in client.get('/v1/events',headers=H).json()]
+    assert 'lead.review_saved' in actions
+    assert 'lead.policy_evaluated' in actions
+
+
+def test_human_review_cannot_override_policy_fields(client):
+    lead_id=create(client,idem='human-review-key-002').json()['lead_id']
+    client.post(f'/v1/leads/{lead_id}/qualify',headers=H)
+    lead=client.get(f'/v1/leads/{lead_id}',headers=H).json()['lead']
+    response=client.post(
+        f'/v1/leads/{lead_id}/review',
+        headers=H,
+        json={
+            'expected_generation':lead['generation'],
+            'service_type':'boiler_service',
+            'location':'Manchester',
+            'quantity':3,
+            'requested_time':'next week',
+            'confidence':1.0,
+            'safety_flags':[],
+        },
+    )
+    assert response.status_code==422
+
+
+def test_requalification_clears_stale_human_review(client):
+    lead_id = create(
+        client,
+        message="We need a boiler service in Manchester for 3 units.",
+        idem="human-review-rerun-001",
+    ).json()["lead_id"]
+    client.post(f"/v1/leads/{lead_id}/qualify", headers=H)
+    lead = client.get(f"/v1/leads/{lead_id}", headers=H).json()["lead"]
+    saved = client.post(
+        f"/v1/leads/{lead_id}/review",
+        headers=H,
+        json={
+            "expected_generation": lead["generation"],
+            "service_type": "boiler_service",
+            "location": "Manchester",
+            "quantity": 3,
+            "requested_time": "next week",
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["lead"]["reviewed_qualification"] is not None
+
+    rerun = client.post(f"/v1/leads/{lead_id}/qualify", headers=H)
+    assert rerun.status_code == 202
+    refreshed = client.get(f"/v1/leads/{lead_id}", headers=H).json()["lead"]
+    assert refreshed["reviewed_qualification"] is None
+    assert refreshed["reviewed_by"] is None
+    assert refreshed["reviewed_at"] is None
+    assert refreshed["reviewed_fields"] == []
+    assert refreshed["policy_eligible"] is False
+
+
+def test_failed_qualification_does_not_leave_lead_queued(client, monkeypatch):
+    lead_id=create(client,idem='failure-status-key-001').json()['lead_id']
+
+    def fail_qualification(*args, **kwargs):
+        raise RuntimeError('synthetic qualification failure')
+
+    monkeypatch.setattr(main.orchestrator, 'qualify', fail_qualification)
+    queued=client.post(f'/v1/leads/{lead_id}/qualify',headers=H)
+    job=client.get(f"/v1/jobs/{queued.json()['job_id']}",headers=H)
+    lead=client.get(f'/v1/leads/{lead_id}',headers=H).json()['lead']
+
+    assert job.json()['state']=='failed'
+    assert lead['status']=='escalated'
+    assert lead['policy_eligible'] is False
+    assert lead['history'][-1]['action']=='qualification.failed'
+
+
 def test_wrong_reviewer_cannot_send(client):
     lead_id=create(client).json()['lead_id']; client.post(f'/v1/leads/{lead_id}/qualify',headers=H)
     payload={"catalogue_version":"catalogue-v1","line_items":[{"service_code":"boiler_service","description":"Boiler service","quantity":1,"unit_price":150}]}
     quote=client.post(f'/v1/leads/{lead_id}/quotes',headers=H,json=payload).json()
-    client.post(f"/v1/quotes/{quote['id']}/approve",headers=H,json={"expected_generation":quote['generation'],"reviewer_id":"reviewer-a"})
+    reviewer={"X-Tenant-ID":"tenant-a","X-Actor-ID":"reviewer-a","X-Role":"tenant_admin"}
+    client.post(f"/v1/quotes/{quote['id']}/approve",headers=reviewer,json={"expected_generation":quote['generation'],"reviewer_id":"reviewer-a"})
     r=client.post(f"/v1/quotes/{quote['id']}/send",headers=H,json={"channel":"website","approved_by":"reviewer-b"})
     assert r.status_code==403
 

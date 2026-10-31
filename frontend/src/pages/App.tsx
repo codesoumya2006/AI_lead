@@ -47,10 +47,12 @@ import {
   EventRecord,
   formatApiError,
   getTenantId,
+  API_BASE_URL,
   Lead,
   money,
   Quote,
   request,
+  requestHealth,
   SubscriptionContract,
   SubscriptionPlan,
   TenantSettings,
@@ -58,15 +60,23 @@ import {
   UsageSummary,
 } from '../lib/api';
 
-const initialChart = [
-  { day: 'Mon', leads: 12, qualified: 7 },
-  { day: 'Tue', leads: 18, qualified: 11 },
-  { day: 'Wed', leads: 14, qualified: 9 },
-  { day: 'Thu', leads: 23, qualified: 16 },
-  { day: 'Fri', leads: 19, qualified: 12 },
-  { day: 'Sat', leads: 27, qualified: 18 },
-  { day: 'Sun', leads: 22, qualified: 15 },
-];
+type ReviewDraft = {
+  service_type: string;
+  location: string;
+  quantity: string;
+  area: string;
+  frequency: string;
+  requested_time: string;
+};
+
+const reviewInputStyle = {
+  width: '100%',
+  padding: '9px 10px',
+  border: '1px solid #dbe3ee',
+  borderRadius: 7,
+  background: '#fff',
+  color: '#17243b',
+};
 
 const fmtDate = (v?: string | null) => {
   if (!v) return '—';
@@ -81,6 +91,13 @@ const fmtDate = (v?: string | null) => {
     return String(v);
   }
 };
+
+const fmtUsd = (value: number, maximumFractionDigits = 2) =>
+  new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits,
+  }).format(value);
 
 function StatusBadge({ value }: { value: string }) {
   const map: Record<string, string> = {
@@ -154,6 +171,14 @@ export function App() {
   // Modals
   const [showNew, setShowNew] = useState(false);
   const [detail, setDetail] = useState<Lead | null>(null);
+  const [reviewDraft, setReviewDraft] = useState<ReviewDraft>({
+    service_type: '',
+    location: '',
+    quantity: '',
+    area: '',
+    frequency: '',
+    requested_time: '',
+  });
   const [quoteDetail, setQuoteDetail] = useState<Quote | null>(null);
   const [eventDetail, setEventDetail] = useState<EventRecord | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
@@ -216,17 +241,15 @@ export function App() {
     setError('');
     try {
       const [d, l, q, u, ev, s, p, c, h] = await Promise.all([
-        request<Dashboard>('/dashboard').catch(() => null),
-        request<Lead[]>('/leads').catch(() => []),
-        request<Quote[]>('/quotes').catch(() => []),
-        request<UsageSummary>('/usage').catch(() => null),
-        request<EventRecord[]>('/events').catch(() => []),
-        request<TenantSettings>('/settings').catch(() => null),
-        request<SubscriptionPlan[]>('/billing/plans').catch(() => []),
-        request<SubscriptionContract[]>('/billing/contracts').catch(() => []),
-        fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/healthz`)
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null),
+        request<Dashboard>('/dashboard'),
+        request<Lead[]>('/leads'),
+        request<Quote[]>('/quotes'),
+        request<UsageSummary>('/usage'),
+        request<EventRecord[]>('/events'),
+        request<TenantSettings>('/settings'),
+        request<SubscriptionPlan[]>('/billing/plans'),
+        request<SubscriptionContract[]>('/billing/contracts'),
+        requestHealth<any>(),
       ]);
       setDashboard(d);
       setLeads(l);
@@ -298,24 +321,36 @@ export function App() {
         { method: 'POST' }
       );
       notify(`Qualification queued (Job: ${res.job_id}). Polling status...`);
-      let completed = false;
+      let terminalState: 'completed' | 'failed' | null = null;
       for (let i = 0; i < 8; i++) {
         await new Promise((r) => setTimeout(r, 600));
-        const job = await request<{ state: string }>(`/jobs/${res.job_id}`).catch(() => null);
+        const job = await request<{ state: string }>(`/jobs/${res.job_id}`);
         if (job && (job.state === 'completed' || job.state === 'failed')) {
-          completed = true;
+          terminalState = job.state;
           break;
         }
       }
       await load();
       if (detail && detail.id === lead.id) {
-        const updated = await request<{ lead: Lead }>(`/leads/${lead.id}`).catch(() => null);
-        if (updated?.lead) setDetail(updated.lead);
+        const updated = await request<{ lead: Lead }>(`/leads/${lead.id}`);
+        setDetail(updated.lead);
+        const qualification =
+          updated.lead.reviewed_qualification || updated.lead.qualification;
+        setReviewDraft({
+          service_type: qualification?.service_type || '',
+          location: qualification?.location || '',
+          quantity: qualification?.quantity?.toString() || '',
+          area: qualification?.area || '',
+          frequency: qualification?.frequency || '',
+          requested_time: qualification?.requested_time || '',
+        });
       }
       notify(
-        completed
+        terminalState === 'completed'
           ? `Qualification finished for ${lead.id}.`
-          : `Qualification still processing in background (Job: ${res.job_id}).`
+          : terminalState === 'failed'
+            ? `Qualification failed for ${lead.id}; the lead was escalated for review.`
+            : `Qualification still processing in background (Job: ${res.job_id}).`
       );
     } catch (e) {
       notify(formatApiError(e));
@@ -328,14 +363,99 @@ export function App() {
     try {
       const d = await request<{ lead: Lead; quotes: Quote[] }>(`/leads/${lead.id}`);
       setDetail(d.lead);
+      const qualification = d.lead.reviewed_qualification || d.lead.qualification;
+      setReviewDraft({
+        service_type: qualification?.service_type || '',
+        location: qualification?.location || '',
+        quantity: qualification?.quantity?.toString() || '',
+        area: qualification?.area || '',
+        frequency: qualification?.frequency || '',
+        requested_time: qualification?.requested_time || '',
+      });
     } catch (e) {
       notify(e instanceof Error ? e.message : 'Could not load lead');
     }
   };
 
+  const saveReview = async () => {
+    if (!detail?.qualification) {
+      notify('Run qualification before saving a human review.');
+      return;
+    }
+    let quantity: number | null = null;
+    if (reviewDraft.quantity.trim()) {
+      quantity = Number(reviewDraft.quantity);
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10000) {
+        notify('Quantity must be a whole number between 1 and 10,000.');
+        return;
+      }
+    }
+
+    setBusy(true);
+    try {
+      const result = await request<{ lead: Lead; corrected_fields: string[] }>(
+        `/leads/${detail.id}/review`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            expected_generation: detail.generation,
+            service_type: reviewDraft.service_type.trim() || null,
+            location: reviewDraft.location.trim() || null,
+            quantity,
+            area: reviewDraft.area.trim() || null,
+            frequency: reviewDraft.frequency.trim() || null,
+            requested_time: reviewDraft.requested_time.trim() || null,
+          }),
+        }
+      );
+      setDetail(result.lead);
+      const qualification =
+        result.lead.reviewed_qualification || result.lead.qualification;
+      setReviewDraft({
+        service_type: qualification?.service_type || '',
+        location: qualification?.location || '',
+        quantity: qualification?.quantity?.toString() || '',
+        area: qualification?.area || '',
+        frequency: qualification?.frequency || '',
+        requested_time: qualification?.requested_time || '',
+      });
+      await load();
+      notify(`Human review saved. Corrected fields: ${result.corrected_fields.join(', ') || 'none'}. Evaluate policy to continue.`);
+    } catch (e) {
+      notify(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const evaluatePolicy = async () => {
+    if (!detail?.reviewed_qualification) {
+      notify('Save human corrections before evaluating policy.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await request<{ lead: Lead; eligible: boolean; reasons: string[] }>(
+        `/leads/${detail.id}/policy/evaluate`,
+        { method: 'POST' }
+      );
+      setDetail(result.lead);
+      await load();
+      notify(
+        result.eligible
+          ? 'Deterministic policy passed. This lead is eligible for a quote.'
+          : `Policy blocked this lead: ${result.reasons.join(', ')}`
+      );
+    } catch (e) {
+      notify(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // Quote Workflow
   const createQuote = async (lead: Lead) => {
-    const q = lead.qualification;
+    const q = lead.reviewed_qualification || lead.qualification;
     if (!q?.service_type || !q.quantity || !settings?.service_catalogue?.[q.service_type]) {
       notify(
         'An eligible catalogue service code and quantity are required before creating a quote.'
@@ -378,6 +498,7 @@ export function App() {
     try {
       await request(`/quotes/${q.id}/approve`, {
         method: 'POST',
+        headers: { 'X-Actor-ID': approverId.trim() || 'demo-reviewer' },
         body: JSON.stringify({
           expected_generation: q.generation,
           reviewer_id: approverId.trim() || 'demo-reviewer',
@@ -398,11 +519,13 @@ export function App() {
   const sendQuote = async (q: Quote) => {
     setBusy(true);
     try {
+      const actorId = q.approved_by || approverId || 'demo-reviewer';
       const r = await request<{ notice?: string; status?: string }>(`/quotes/${q.id}/send`, {
         method: 'POST',
+        headers: { 'X-Actor-ID': actorId },
         body: JSON.stringify({
           channel: 'website',
-          approved_by: q.approved_by || approverId || 'demo-reviewer',
+          approved_by: actorId,
         }),
       });
       notify(r.notice || r.status || 'Sandbox send recorded.');
@@ -602,6 +725,38 @@ export function App() {
   }, [leads, quotes, search]);
 
   const pendingQuotes = quotes.filter((q) => q.status === 'draft');
+  const tenantBudget =
+    usage?.ai_monthly_budget_usd ??
+    dashboard?.ai_monthly_budget_usd ??
+    settings?.ai_monthly_budget_usd ??
+    null;
+  const remainingBudget =
+    usage?.remaining_budget_usd ?? dashboard?.remaining_budget_usd ?? null;
+  const monthlySpend = usage?.monthly_spend_usd ?? dashboard?.monthly_spend_usd ?? 0;
+  const budgetUsage =
+    tenantBudget && tenantBudget > 0
+      ? Math.min(100, Math.round((monthlySpend / tenantBudget) * 100))
+      : 0;
+  const chartData = useMemo(() => {
+    const today = new Date();
+    const utcToday = new Date(
+      Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate())
+    );
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(utcToday);
+      date.setUTCDate(date.getUTCDate() - (6 - index));
+      const dateKey = date.toISOString().slice(0, 10);
+      const dailyLeads = leads.filter((lead) => lead.created_at.slice(0, 10) === dateKey);
+      return {
+        day: date.toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'UTC' }),
+        leads: dailyLeads.length,
+        qualified: dailyLeads.filter((lead) =>
+          ['qualified', 'quote_draft', 'quote_approved', 'sent'].includes(lead.status)
+        ).length,
+      };
+    });
+  }, [leads]);
+  const hasChartActivity = chartData.some((day) => day.leads > 0);
 
   const titles: Record<string, { title: string; subtitle: string }> = {
     Overview: { title: 'Overview', subtitle: 'Live operations and pipeline snapshot' },
@@ -610,7 +765,12 @@ export function App() {
     Quotes: { title: 'Quote Management', subtitle: 'Tenant-governed quotations with deterministic VAT and rule versions' },
     Approvals: { title: 'Approval Review Queue', subtitle: 'Human-in-the-loop review before any quote can be sent' },
     Customers: { title: 'Customer Directory', subtitle: 'Tenant-scoped customer cases, service histories, and quote totals' },
-    'AI Activity & Usage': { title: 'AI Activity & Usage', subtitle: 'Live model telemetry, token metrics, and $1.00 budget enforcement' },
+    'AI Activity & Usage': {
+      title: 'AI Activity & Usage',
+      subtitle: tenantBudget == null
+        ? 'Live model telemetry and token metrics; no monthly AI budget is configured'
+        : `Live model telemetry and token metrics; ${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(tenantBudget)} monthly budget`,
+    },
     'Audit Logs': { title: 'Immutable Audit Trail', subtitle: 'Cryptographically hashed event ledger of all workflow actions' },
     Catalogue: { title: 'Service Catalogue & Tariffs', subtitle: 'Tenant service pricing and two-person subscription governance' },
     Settings: { title: 'Workspace Settings', subtitle: 'Tenant configuration, VAT rates, territories, and guardrails' },
@@ -639,18 +799,19 @@ export function App() {
         />
 
         <div className="page-content">
-          {error && (
+          {error ? (
             <div className="error-banner">
               <CircleAlert size={17} />
               <div>
                 <strong>API connection warning</strong>
-                <p>{error}. Start the FastAPI service at http://localhost:8000 and click Retry.</p>
+                <p>{error}. Verify the FastAPI service at <code>{API_BASE_URL}</code> and click Retry.</p>
               </div>
               <button onClick={() => void load()}>
                 <RefreshCw size={14} /> Retry
               </button>
             </div>
-          )}
+          ) : (
+          <>
 
           {/* 1. OVERVIEW */}
           {active === 'Overview' && (
@@ -705,11 +866,11 @@ export function App() {
                 />
                 <StatCard
                   label="AI Monthly Spend"
-                  value={`$${(dashboard?.monthly_spend_usd ?? usage?.monthly_spend_usd ?? 0).toFixed(4)}`}
-                  change={`Budget: $${(dashboard?.ai_monthly_budget_usd ?? settings?.ai_monthly_budget_usd ?? 1.0).toFixed(2)}`}
+                  value={fmtUsd(monthlySpend, 4)}
+                  change={`Budget: ${tenantBudget == null ? 'not configured' : fmtUsd(tenantBudget)}`}
                   icon={<Bot size={18} />}
                   tone="amber"
-                  footer={`Remaining: $${(dashboard?.remaining_budget_usd ?? 1.0).toFixed(4)}`}
+                  footer={`Remaining: ${remainingBudget == null ? '—' : fmtUsd(remainingBudget, 4)}`}
                 />
               </section>
 
@@ -734,7 +895,8 @@ export function App() {
                   </div>
                   <div className="chart-wrap">
                     <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={initialChart} margin={{ top: 10, right: 4, left: -22, bottom: 0 }}>
+                      {hasChartActivity ? (
+                      <AreaChart data={chartData} margin={{ top: 10, right: 4, left: -22, bottom: 0 }}>
                         <defs>
                           <linearGradient id="leadFill" x1="0" y1="0" x2="0" y2="1">
                             <stop offset="0%" stopColor="#5b7cff" stopOpacity={0.18} />
@@ -759,6 +921,11 @@ export function App() {
                         <Area type="monotone" dataKey="leads" name="Enquiries" stroke="#5b7cff" strokeWidth={2.5} fill="url(#leadFill)" />
                         <Area type="monotone" dataKey="qualified" name="Qualified" stroke="#42c6a5" strokeWidth={2.5} fill="url(#qualFill)" />
                       </AreaChart>
+                      ) : (
+                        <div style={{ padding: 28, textAlign: 'center', color: '#64748b', fontSize: 13 }}>
+                          No lead activity recorded in the last seven days.
+                        </div>
+                      )}
                     </ResponsiveContainer>
                   </div>
                   <div className="chart-footnote">
@@ -796,10 +963,13 @@ export function App() {
                   <div className="health-list">
                     <HealthItem label="Tenant Isolation" detail={`Scoped to ${getTenantId()}`} />
                     <HealthItem label="Quote Approval Gate" detail="Human Reviewer Required" />
-                    <HealthItem label="AI Spend Guardrail" detail={`$1.00 Monthly Limit`} />
+                    <HealthItem
+                      label="AI Spend Guardrail"
+                      detail={tenantBudget == null ? 'No monthly limit configured' : `${fmtUsd(tenantBudget)} monthly limit`}
+                    />
                     <HealthItem
                       label="Configured Model"
-                      detail={health?.model_configured ? 'gemini-3.8-flash' : 'Deterministic Fallback'}
+                      detail={health?.model_configured ? (health?.model_name || 'Configured model') : 'Deterministic Fallback'}
                     />
                   </div>
                   <button className="text-button" onClick={() => setActive('Settings')}>
@@ -915,7 +1085,7 @@ export function App() {
                   <button
                     className="button button-secondary"
                     onClick={() =>
-                      window.open(`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/v1/exports/leads.csv`, '_blank')
+                      window.open(`${API_BASE_URL}/v1/exports/leads.csv`, '_blank')
                     }
                   >
                     <Download size={15} /> Export CSV
@@ -977,7 +1147,9 @@ export function App() {
               <div className="list-toolbar">
                 <div>
                   <h2>AI Qualification Hub</h2>
-                  <p>Constrained Gemini 3.8 Flash structured extraction with rule-based fallback safeguards.</p>
+                  <p>
+                    Structured extraction with {health?.model_configured ? health.model_name : 'deterministic fallback'} and rule-based safeguards.
+                  </p>
                 </div>
                 <button className="button button-secondary" onClick={() => void load()}>
                   <RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh Queue
@@ -1447,7 +1619,7 @@ export function App() {
               <div className="list-toolbar">
                 <div>
                   <h2>AI Activity, Telemetry &amp; Budget Guardrails</h2>
-                  <p>Accurate Google Gemini token accounting, thinking token tracking, and strict $1.00 budget enforcement.</p>
+                  <p>Provider token accounting and tenant-configured AI budget enforcement.</p>
                 </div>
                 <button className="button button-secondary" onClick={() => void load()}>
                   <RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh Telemetry
@@ -1457,32 +1629,32 @@ export function App() {
               <div className="stat-grid" style={{ marginBottom: 20 }}>
                 <StatCard
                   label="Monthly AI Spend"
-                  value={`$${(usage?.monthly_spend_usd ?? dashboard?.monthly_spend_usd ?? 0).toFixed(6)}`}
+                  value={fmtUsd(monthlySpend, 6)}
                   change="Measured token costs"
                   icon={<BadgePoundSterling size={18} />}
                   tone="amber"
-                  footer={`Strict $1.00 Budget Cap`}
+                  footer={tenantBudget == null ? 'No budget cap configured' : `${fmtUsd(tenantBudget)} tenant budget cap`}
                 />
                 <StatCard
                   label="Monthly Tenant Budget"
-                  value={`$${(usage?.ai_monthly_budget_usd ?? settings?.ai_monthly_budget_usd ?? 1.0).toFixed(2)}`}
-                  change="Enforced at API gateway"
+                  value={tenantBudget == null ? 'Not configured' : fmtUsd(tenantBudget)}
+                  change="Enforced before qualification"
                   icon={<ShieldCheck size={18} />}
                   tone="blue"
-                  footer="HTTP 429 when exhausted"
+                  footer={tenantBudget == null ? 'No spend limit is active' : 'HTTP 429 when exhausted'}
                 />
                 <StatCard
                   label="Remaining Allowance"
-                  value={`$${(usage?.remaining_budget_usd ?? 1.0).toFixed(6)}`}
-                  change="Real-time balance"
+                  value={remainingBudget == null ? '—' : fmtUsd(remainingBudget, 6)}
+                  change={remainingBudget == null ? 'No configured budget' : 'Real-time balance'}
                   icon={<Gauge size={18} />}
                   tone="green"
-                  footer="Available for Gemini calls"
+                  footer={remainingBudget == null ? 'Unlimited by spend budget' : 'Available for Gemini calls'}
                 />
                 <StatCard
                   label="Active Model Identifier"
-                  value="gemini-3.8-flash"
-                  change="$0.75 in / $3.75 out per 1M"
+                  value={health?.model_configured ? health.model_name : 'Deterministic fallback'}
+                  change="Configured provider model"
                   icon={<Bot size={18} />}
                   tone="violet"
                   footer="Google GenAI SDK"
@@ -1493,35 +1665,15 @@ export function App() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 600 }}>
                   <span>Monthly Budget Consumption</span>
                   <span>
-                    {Math.min(
-                      100,
-                      Math.round(
-                        ((usage?.monthly_spend_usd ?? 0) /
-                          (usage?.ai_monthly_budget_usd || 1.0)) *
-                          100
-                      )
-                    )}
-                    % used ($1.00 max)
+                    {tenantBudget == null ? 'No budget configured' : `${budgetUsage}% used (${fmtUsd(tenantBudget)} cap)`}
                   </span>
                 </div>
                 <div className="budget-meter">
                   <div
                     className={`budget-meter-fill ${
-                      (usage?.monthly_spend_usd ?? 0) > 0.8 ? 'danger' : (usage?.monthly_spend_usd ?? 0) > 0.5 ? 'warning' : ''
+                      budgetUsage > 80 ? 'danger' : budgetUsage > 50 ? 'warning' : ''
                     }`}
-                    style={{
-                      width: `${Math.min(
-                        100,
-                        Math.max(
-                          2,
-                          Math.round(
-                            ((usage?.monthly_spend_usd ?? 0) /
-                              (usage?.ai_monthly_budget_usd || 1.0)) *
-                              100
-                          )
-                        )
-                      )}%`,
-                    }}
+                    style={{ width: `${budgetUsage}%` }}
                   />
                 </div>
               </div>
@@ -1531,9 +1683,9 @@ export function App() {
                 <div>
                   <strong>Model Transparency Policy</strong>
                   <p>
-                    When Google Gemini 3.8 Flash is available and within quota, actual prompt, candidates, and thinking tokens
-                    are accounted for at $0.75 / $3.75 rates. If Google Free-Tier quota (HTTP 429) is reached, the system executes
-                    a deterministic rule fallback clearly flagged with an amber badge. The system never fabricates AI output.
+                    The configured model is {health?.model_configured ? health.model_name : 'not configured'}. Successful model
+                    token usage is recorded; provider failures use a clearly labelled deterministic fallback and are never
+                    represented as Gemini output.
                   </p>
                 </div>
               </div>
@@ -1931,8 +2083,8 @@ export function App() {
                 />
                 <Setting
                   label="AI Model &amp; Rates"
-                  value="gemini-3.8-flash"
-                  detail="$0.75 / 1M prompt tokens, $3.75 / 1M output tokens (standard paid rates)."
+                  value={health?.model_configured ? health.model_name : 'Deterministic fallback'}
+                  detail="Token cost rates are applied by the backend when provider usage data is available."
                 />
                 <Setting
                   label="Outbound Messaging"
@@ -1970,7 +2122,10 @@ export function App() {
                     <br />
                     2. <strong>Human-in-the-Loop Approvals:</strong> Quotes must be approved by an authorized reviewer with generation compare-and-swap checks.
                     <br />
-                    3. <strong>Budget Invariant:</strong> The $1.00 AI monthly budget is strictly enforced at the API gateway before calling model inference.
+                    3. <strong>Budget Invariant:</strong>{' '}
+                    {tenantBudget == null
+                      ? 'No tenant AI spend budget is configured.'
+                      : `The ${fmtUsd(tenantBudget)} tenant AI spend budget is checked before qualification.`}
                   </p>
                 </div>
               </div>
@@ -2027,6 +2182,8 @@ export function App() {
                 </div>
               </div>
             </section>
+          )}
+          </>
           )}
         </div>
       </main>
@@ -2176,7 +2333,7 @@ export function App() {
                   >
                     <CheckCircle2 size={18} style={{ color: '#16a34a', marginTop: 2, flexShrink: 0 }} />
                     <div>
-                      <strong>Verified Google Gemini Result: <code>{detail.qualification.model_used}</code></strong>
+                      <strong>Gemini structured extraction: <code>{detail.qualification.model_used}</code></strong>
                       <div style={{ marginTop: 4, fontSize: 11, color: '#15803d' }}>
                         Input Tokens: {detail.qualification.input_tokens ?? '—'} · Output Tokens: {detail.qualification.output_tokens ?? '—'}
                         {detail.qualification.thinking_tokens ? ` (${detail.qualification.thinking_tokens} thinking)` : ''}
@@ -2192,6 +2349,9 @@ export function App() {
                     ['Service Type', detail.qualification.service_type || 'Not identified'],
                     ['Location', detail.qualification.location || 'Not identified'],
                     ['Quantity', detail.qualification.quantity ?? 'Not identified'],
+                    ['Area', detail.qualification.area || 'Not identified'],
+                    ['Frequency', detail.qualification.frequency || 'Not identified'],
+                    ['Requested time', detail.qualification.requested_time || 'Not identified'],
                     ['Confidence', `${Math.round(detail.qualification.confidence * 100)}%`],
                     ['Extraction Method', detail.qualification.model_used === 'deterministic_fallback' ? 'Heuristic Rule Fallback' : detail.qualification.model_used],
                     ['Verifier Ran', detail.qualification.verifier_used ? 'Yes' : 'Not required'],
@@ -2202,6 +2362,109 @@ export function App() {
                     </div>
                   ))}
                 </div>
+
+                <section
+                  aria-label="Human qualification review"
+                  style={{
+                    marginTop: 16,
+                    padding: 14,
+                    border: '1px solid #dbe3ee',
+                    borderRadius: 10,
+                    background: '#fbfdff',
+                  }}
+                >
+                  <div style={{ marginBottom: 12 }}>
+                    <strong>Human review</strong>
+                    <p style={{ margin: '4px 0 0', color: '#64748b', fontSize: 12 }}>
+                      AI suggestions remain unchanged. Saved edits are attributed to the reviewer and must pass deterministic policy evaluation.
+                    </p>
+                    {detail.reviewed_by && (
+                      <p style={{ margin: '6px 0 0', color: '#475569', fontSize: 12 }}>
+                        Reviewed by {detail.reviewed_by} at {fmtDate(detail.reviewed_at)}.
+                        {detail.reviewed_fields.length > 0
+                          ? ` Corrected: ${detail.reviewed_fields.join(', ')}.`
+                          : ' No AI values changed.'}
+                      </p>
+                    )}
+                  </div>
+                  <div className="detail-grid">
+                    <label className="detail-fact">
+                      <span>Service · AI suggested {detail.qualification.service_type || 'none'}</span>
+                      <select
+                        className="select-input"
+                        value={reviewDraft.service_type}
+                        onChange={(e) => setReviewDraft({ ...reviewDraft, service_type: e.target.value })}
+                      >
+                        <option value="">Not provided</option>
+                        {reviewDraft.service_type &&
+                          !settings?.service_catalogue?.[reviewDraft.service_type] && (
+                            <option value={reviewDraft.service_type}>{reviewDraft.service_type} (not in catalogue)</option>
+                          )}
+                        {Object.entries(settings?.service_catalogue || {}).map(([code, service]) => (
+                          <option key={code} value={code}>{service.label} ({code})</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="detail-fact">
+                      <span>Location · AI suggested {detail.qualification.location || 'none'}</span>
+                      <input
+                        style={reviewInputStyle}
+                        value={reviewDraft.location}
+                        onChange={(e) => setReviewDraft({ ...reviewDraft, location: e.target.value })}
+                      />
+                    </label>
+                    <label className="detail-fact">
+                      <span>Quantity · AI suggested {detail.qualification.quantity ?? 'none'}</span>
+                      <input
+                        style={reviewInputStyle}
+                        type="number"
+                        min="1"
+                        max="10000"
+                        step="1"
+                        value={reviewDraft.quantity}
+                        onChange={(e) => setReviewDraft({ ...reviewDraft, quantity: e.target.value })}
+                      />
+                    </label>
+                    <label className="detail-fact">
+                      <span>Area · AI suggested {detail.qualification.area || 'none'}</span>
+                      <input
+                        style={reviewInputStyle}
+                        value={reviewDraft.area}
+                        onChange={(e) => setReviewDraft({ ...reviewDraft, area: e.target.value })}
+                      />
+                    </label>
+                    <label className="detail-fact">
+                      <span>Frequency · AI suggested {detail.qualification.frequency || 'none'}</span>
+                      <input
+                        style={reviewInputStyle}
+                        value={reviewDraft.frequency}
+                        onChange={(e) => setReviewDraft({ ...reviewDraft, frequency: e.target.value })}
+                      />
+                    </label>
+                    <label className="detail-fact">
+                      <span>Requested time · AI suggested {detail.qualification.requested_time || 'none'}</span>
+                      <input
+                        style={reviewInputStyle}
+                        value={reviewDraft.requested_time}
+                        onChange={(e) => setReviewDraft({ ...reviewDraft, requested_time: e.target.value })}
+                      />
+                    </label>
+                  </div>
+                  {detail.policy_eligible !== null && detail.policy_eligible !== undefined && (
+                    <div className={detail.policy_eligible ? 'info-banner' : 'warning-banner'} style={{ marginTop: 12 }}>
+                      <p>
+                        {detail.policy_eligible
+                          ? 'Deterministic policy passed; quote eligibility is confirmed.'
+                          : `Policy blocked this lead: ${detail.policy_reasons.join(', ')}`}
+                      </p>
+                    </div>
+                  )}
+                  {detail.reviewed_qualification && detail.policy_eligible == null && (
+                    <p style={{ margin: '10px 0 0', color: '#92400e', fontSize: 12 }}>
+                      Corrections are saved but have not yet been evaluated for quote eligibility.
+                    </p>
+                  )}
+                </section>
 
                 {detail.qualification.missing_fields.length > 0 && (
                   <div className="info-banner">
@@ -2229,8 +2492,44 @@ export function App() {
                       {detail.qualification.timing_ms.total_duration_ms != null && (
                         <span>Total: <strong style={{ color: '#0f172a' }}>{detail.qualification.timing_ms.total_duration_ms} ms</strong></span>
                       )}
-                      {detail.qualification.timing_ms.gemini_duration_ms != null && (
-                        <span>Gemini API: <strong style={{ color: '#0f172a' }}>{detail.qualification.timing_ms.gemini_duration_ms} ms</strong></span>
+                      {detail.qualification.timing_ms.gemini_api_request_ms != null && (
+                        <span>Gemini HTTP: <strong style={{ color: '#0f172a' }}>{(
+                          detail.qualification.timing_ms.gemini_api_request_ms +
+                          (detail.qualification.timing_ms.verifier_api_request_ms || 0)
+                        ).toFixed(2)} ms</strong></span>
+                      )}
+                      {detail.qualification.timing_ms.request_preparation_ms != null && (
+                        <span>Request prep: <strong style={{ color: '#0f172a' }}>{detail.qualification.timing_ms.request_preparation_ms.toFixed(2)} ms</strong></span>
+                      )}
+                      {detail.qualification.timing_ms.gemini_attempt_count != null && (
+                        <span>Attempts: <strong style={{ color: '#0f172a' }}>{(
+                          detail.qualification.timing_ms.gemini_attempt_count +
+                          (detail.qualification.timing_ms.verifier_attempt_count || 0)
+                        )}</strong></span>
+                      )}
+                      {detail.qualification.timing_ms.gemini_retry_count != null && (
+                        <span>Retries: <strong style={{ color: '#0f172a' }}>{(
+                          detail.qualification.timing_ms.gemini_retry_count +
+                          (detail.qualification.timing_ms.verifier_retry_count || 0)
+                        )}</strong> ({(
+                          detail.qualification.timing_ms.gemini_retry_delay_ms +
+                          (detail.qualification.timing_ms.verifier_retry_delay_ms || 0)
+                        ).toFixed(2)} ms)</span>
+                      )}
+                      {detail.qualification.timing_ms.gemini_response_parse_ms != null && (
+                        <span>Response parse: <strong style={{ color: '#0f172a' }}>{(
+                          detail.qualification.timing_ms.gemini_response_parse_ms +
+                          (detail.qualification.timing_ms.verifier_response_parse_ms || 0)
+                        ).toFixed(2)} ms</strong></span>
+                      )}
+                      {detail.qualification.timing_ms.pydantic_validation_ms != null && (
+                        <span>Validation: <strong style={{ color: '#0f172a' }}>{(
+                          detail.qualification.timing_ms.pydantic_validation_ms +
+                          (detail.qualification.timing_ms.verifier_validation_ms || 0)
+                        ).toFixed(2)} ms</strong></span>
+                      )}
+                      {detail.qualification.timing_ms.policy_evaluation_ms != null && (
+                        <span>Policy: <strong style={{ color: '#0f172a' }}>{detail.qualification.timing_ms.policy_evaluation_ms.toFixed(2)} ms</strong></span>
                       )}
                       {detail.qualification.timing_ms.verifier_duration_ms != null && (
                         <span>Verifier: <strong style={{ color: '#0f172a' }}>{detail.qualification.timing_ms.verifier_duration_ms} ms</strong></span>
@@ -2263,6 +2562,26 @@ export function App() {
                 >
                   <RefreshCw size={15} className={busy ? 'spin' : ''} /> Re-run Qualification
                 </button>
+              )}
+              {detail.qualification && !detail.quote_ids.length && (
+                <>
+                  <button
+                    className="button button-secondary"
+                    disabled={busy}
+                    onClick={() => void saveReview()}
+                  >
+                    Save corrections
+                  </button>
+                  {detail.reviewed_qualification && (
+                    <button
+                      className="button button-secondary"
+                      disabled={busy}
+                      onClick={() => void evaluatePolicy()}
+                    >
+                      Evaluate policy
+                    </button>
+                  )}
+                </>
               )}
               {detail.status === 'qualified' && (
                 <button
