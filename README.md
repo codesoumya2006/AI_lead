@@ -63,7 +63,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. The UI uses the local API at `http://localhost:8000` by default. To change it, set `VITE_API_URL` before building.
+Open `http://localhost:5173`. The UI uses the local API at `http://127.0.0.1:8000` by default, matching the backend bind address. Set `VITE_API_URL` in the frontend terminal before starting Vite or building to use another API origin.
 
 ### 3. Optional Gemini
 
@@ -96,6 +96,8 @@ npm run build
 - `GET /v1/leads` and `GET /v1/leads/{id}` — tenant-scoped cases and quote history.
 - `POST /v1/leads/{id}/qualify` — asynchronous qualification (`Cloud Tasks` when configured; local background task only in local mode).
 - `GET /v1/jobs/{id}` — job status and safe retry metadata.
+- `POST /v1/leads/{id}/review` — persist authorized human corrections without overwriting the original AI result or enquiry.
+- `POST /v1/leads/{id}/policy/evaluate` — explicitly evaluate reviewed values against deterministic tenant policy.
 - `POST /v1/leads/{id}/quotes` — deterministic quote draft from tenant catalogue.
 - `POST /v1/quotes/{id}/approve` — generation-aware human approval.
 - `POST /v1/quotes/{id}/send` — requires approval and records sandbox intent; never claims delivery.
@@ -109,6 +111,8 @@ npm run build
 - All inbound text is untrusted data; it is JSON-quoted in model prompts. The model cannot execute code, choose arbitrary URLs, change pricing, invoke unrestricted tools or send messages.
 - Structured model output is validated through Pydantic. Evidence and confidence reason are returned to reviewers. Suspicious instructions trigger safety flags and escalation.
 - A conditional verifier checks extracted facts when confidence is low, information is missing or a safety flag is raised.
+- Qualification requires a minimum 10-second Gemini request deadline. Only HTTP 503 is retried, with at most three total attempts; quota responses (429) fall back without retry. Each successful qualification records request preparation, API, retry delay/count, response parsing, Pydantic validation, verifier, policy, storage and total durations.
+- A failed qualification job remains explicitly failed and its lead is escalated and marked policy-ineligible. Requalification clears stale human-review data, and qualification is locked once a quote exists.
 - Pricing uses the tenant's versioned service catalogue. A client-supplied unit price that differs from the configured price is rejected. VAT and totals are computed by deterministic code.
 - Quote send requires a persisted approval by the same reviewer identity. Local sends are only audit records, never actual external messages.
 - Local storage has atomic file replacement and generation checks for development. The GCS adapter uses object generation preconditions and the Terraform bucket has versioning, uniform bucket access and public-access prevention.
@@ -129,11 +133,11 @@ These are not silently claimed as done:
 7. WhatsApp requires approved business/provider setup, templates, consent/opt-out logic, signature verification and replay/idempotency tests. It remains disabled by default.
 8. Configure the frontend API origin and real OIDC sign-in integration before exposing the console outside local development.
 9. Validate UK VAT rules, privacy basis, retention, DPA/processor map, DSAR/deletion path, SLOs, budgets and recovery procedure with the designated owners.
-10. The UI pipeline chart is explicitly labelled as a demo trend. It is not measured BigQuery analytics and must be replaced with verified metrics before customer demonstrations.
+10. The UI seven-day trend is derived from the tenant's stored lead creation dates. It is not BigQuery analytics or an operational conversion-funnel measure.
 
 The documents require reviewed Terraform and explicit release authorization. Do not run `terraform apply` or onboard a production tenant until those approvals and evidence exist.
 
-The configured agent path uses Google ADK `Agent` + `Runner` with an isolated in-memory session per model turn. The second verification role is invoked conditionally. Model calls and fallback behavior emit duration-tagged structured logs; raw customer messages are not logged.
+The configured agent path uses the Google Gen AI SDK with schema-constrained JSON output. The second verification role is invoked conditionally. Model calls and fallback behavior emit duration-tagged structured logs; raw customer messages are not logged. Gemini SDK retries are disabled in favor of a measured, bounded application retry loop for HTTP 503 only; HTTP 429 does not retry.
 
 ## Subscription configuration (no payment processing)
 

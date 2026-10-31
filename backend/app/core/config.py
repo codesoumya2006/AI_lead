@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     worker_url: str | None = None
     worker_service_account: str | None = None
     google_api_key: str | None = None
-    gemini_model: str = "gemini-3.8-flash"
-    gemini_input_usd_per_million: float | None = None
-    gemini_output_usd_per_million: float | None = None
+    gemini_model: str = "gemini-3.1-flash-lite"
+    gemini_input_usd_per_million: float | None = 0.25
+    gemini_output_usd_per_million: float | None = 1.50
     gemini_timeout_seconds: float = 8.0
     gemini_max_retries: int = 1
     gemini_retry_delay_seconds: float = 1.0

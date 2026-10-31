@@ -1,4 +1,4 @@
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
 export function getTenantId(): string {
   return localStorage.getItem('tenant_id') || 'northstar-test';
@@ -8,9 +8,17 @@ export function setTenantId(id: string): void {
   localStorage.setItem('tenant_id', id);
 }
 
+export async function requestHealth<T>(): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}/healthz`);
+  if (!response.ok) {
+    throw new Error(`Health check failed: HTTP ${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const currentTenant = getTenantId();
-  const response = await fetch(`${API}/v1${path}`, {
+  const response = await fetch(`${API_BASE_URL}/v1${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -21,8 +29,17 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
     },
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body));
+    const bodyText = await response.text();
+    let detail = response.statusText || 'Request failed';
+    if (bodyText) {
+      try {
+        const body = JSON.parse(bodyText);
+        detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body);
+      } catch {
+        detail = bodyText;
+      }
+    }
+    throw new Error(`HTTP ${response.status}: ${detail}`);
   }
   return response.json();
 }
@@ -44,38 +61,49 @@ export function formatApiError(err: unknown): string {
   return msg;
 }
 
+export type Qualification = {
+  intent?: string;
+  service_type?: string;
+  location?: string;
+  quantity?: number;
+  equipment?: string[];
+  area?: string | null;
+  frequency?: string | null;
+  requested_time?: string;
+  urgency?: string;
+  confidence: number;
+  confidence_reason: string;
+  missing_fields: string[];
+  evidence?: Record<string, string>;
+  safety_flags: string[];
+  injection_detected: boolean;
+  model_used: string;
+  verifier_used: boolean;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  thinking_tokens?: number | null;
+  estimated_cost_usd?: number | null;
+  timing_ms?: Record<string, number>;
+};
+
 export type Lead = {
   id: string;
   tenant_id: string;
   status: string;
+  generation: number;
   channel: string;
   message: string;
   customer_name?: string;
   customer_email?: string;
   created_at: string;
   updated_at?: string;
-  qualification?: {
-    intent?: string;
-    service_type?: string;
-    location?: string;
-    quantity?: number;
-    equipment?: string[];
-    requested_time?: string;
-    urgency?: string;
-    confidence: number;
-    confidence_reason: string;
-    missing_fields: string[];
-    evidence?: Record<string, string>;
-    safety_flags: string[];
-    injection_detected: boolean;
-    model_used: string;
-    verifier_used: boolean;
-    input_tokens?: number | null;
-    output_tokens?: number | null;
-    thinking_tokens?: number | null;
-    estimated_cost_usd?: number | null;
-    timing_ms?: Record<string, number>;
-  };
+  qualification?: Qualification;
+  reviewed_qualification?: Qualification | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  reviewed_fields: string[];
+  policy_eligible?: boolean | null;
+  policy_reasons: string[];
   quote_ids: string[];
   history?: Array<{ action: string; actor_id?: string; at: string; reasons?: string[] }>;
 };

@@ -8,7 +8,7 @@ from app.core.auth import Principal, get_principal, require_role, require_tenant
 from app.core.config import settings
 from app.core.logging import configure_logging, request_context
 from app.domain.schemas import (
-    ApproveQuote, Channel, JobRecord, LeadCreate, LeadRecord, LeadStatus, QuoteCreate, QuoteRecord,
+    ApproveQuote, Channel, JobRecord, LeadCreate, LeadRecord, LeadReviewSubmission, LeadStatus, QuoteCreate, QuoteRecord,
     Role, SendQuote, TenantSettings, SubscriptionContract, SubscriptionPlan, SubscriptionPlanDraft,
     PublishPlan, EventRecord, new_id,
 )
@@ -72,10 +72,15 @@ def _effective_entitlements(tenant: TenantSettings) -> dict:
 def _load_lead(lead_id: str, principal: Principal) -> tuple[LeadRecord, int]:
     found = store.get(_key("leads", principal.tenant_id, lead_id))
     if not found: raise HTTPException(404, "not_found")
-    return LeadRecord.model_validate(found[0]), found[1]
+    lead = LeadRecord.model_validate(found[0])
+    lead.generation = found[1]
+    return lead, found[1]
 
 def _save_lead(lead: LeadRecord, expected: int) -> int:
-    try: return store.put(_key("leads", lead.tenant_id, lead.id), lead, expected_generation=expected)
+    try:
+        generation = store.put(_key("leads", lead.tenant_id, lead.id), lead, expected_generation=expected)
+        lead.generation = generation
+        return generation
     except StoreConflict as exc: raise HTTPException(409, "stale_generation") from exc
 
 def _rate_limit(principal: Principal):
@@ -107,7 +112,13 @@ def _process_qualification(lead_id: str, tenant_id: str, job_id: str):
         tenant = _tenant_settings(tenant_id)
         qualification = orchestrator.qualify(lead.message, tenant)
 
+        policy_started = time.perf_counter()
         qualified, reasons = evaluate_qualification(qualification, tenant)
+        qualification.timing_ms["policy_evaluation_ms"] = round(
+            (time.perf_counter() - policy_started) * 1000.0, 2
+        )
+        lead.policy_eligible = qualified
+        lead.policy_reasons = reasons
 
         # Assemble timing breakdown
         timing = dict(qualification.timing_ms)
@@ -170,14 +181,42 @@ def _process_qualification(lead_id: str, tenant_id: str, job_id: str):
         store.put(_key("jobs", tenant_id, job_id), job, current_job[1] if current_job else 0)
         events.emit(tenant_id, lead_id, "lead.qualification_completed", policy_version=tenant.policy_version, content=qualification.model_dump(mode="json"))
     except Exception:
-        logging.getLogger("workflow").exception("qualification.failed")
+        logger = logging.getLogger("workflow")
+        logger.exception("qualification.failed")
         current = store.get(_key("jobs", tenant_id, job_id))
         if current:
             job = JobRecord.model_validate(current[0])
             job.state = "failed"
             job.errors.append("qualification_failed_safe_to_retry")
+            job.trace.append("qualification.failed")
             job.completed_at = datetime.now(timezone.utc)
             store.put(_key("jobs", tenant_id, job_id), job, current[1])
+        try:
+            current_lead = store.get(_key("leads", tenant_id, lead_id))
+            if current_lead:
+                failed_lead = LeadRecord.model_validate(current_lead[0])
+                failed_lead.status = LeadStatus.ESCALATED
+                failed_lead.policy_eligible = False
+                failed_lead.policy_reasons = ["qualification_execution_failed"]
+                failed_lead.updated_at = datetime.now(timezone.utc)
+                failed_lead.history.append({
+                    "action": "qualification.failed",
+                    "at": failed_lead.updated_at.isoformat(),
+                    "reasons": ["qualification_execution_failed"],
+                })
+                _save_lead(failed_lead, current_lead[1])
+        except Exception:
+            logger.exception("qualification_failure_lead_update_failed")
+        try:
+            events.emit(
+                tenant_id,
+                lead_id,
+                "lead.qualification_failed",
+                result="failed",
+                content={"job_id": job_id, "retry_safe": True},
+            )
+        except Exception:
+            logger.exception("qualification_failure_audit_failed")
 
 def _dispatch_qualification(lead_id: str, tenant_id: str, job_id: str, background: BackgroundTasks) -> str:
     if settings.cloud_tasks_queue and settings.worker_url:
@@ -231,7 +270,7 @@ def flush_audit_event(payload: EventRecord, x_cloudtasks_taskname: str | None = 
     return {"status":"flushed","event_id":payload.event_id}
 
 @app.get("/healthz")
-def health(): return {"status":"ok", "version":"0.1.0", "environment":settings.environment, "model_configured":bool(settings.google_api_key), "persistence":"gcs" if settings.gcs_state_bucket else "local_json_development_only"}
+def health(): return {"status":"ok", "version":"0.1.0", "environment":settings.environment, "model_configured":bool(settings.google_api_key), "model_name":settings.gemini_model, "persistence":"gcs" if settings.gcs_state_bucket else "local_json_development_only"}
 
 @app.get(settings.api_prefix + "/me")
 def me(principal: Principal = Depends(get_principal)):
@@ -296,7 +335,7 @@ def create_lead(payload: LeadCreate, request: Request, principal: Principal = De
         raise HTTPException(503, "idempotency_reservation_incomplete_retry_safely")
     lead=LeadRecord(id=lead_id,tenant_id=principal.tenant_id,channel=payload.channel,external_ref=payload.external_ref,message=payload.message,consent=payload.consent,idempotency_key=payload.idempotency_key,customer_name=payload.customer_name,customer_email=payload.customer_email)
     lead.history.append({"action":"lead.created","actor_id":principal.actor_id,"at":lead.created_at.isoformat()})
-    store.put(_key("leads",principal.tenant_id,lead_id),lead)
+    lead.generation = store.put(_key("leads",principal.tenant_id,lead_id),lead)
     events.emit(principal.tenant_id,lead_id,"lead.created",principal.actor_id,content={"channel":payload.channel.value,"consent":True})
     return {"lead_id":lead_id,"status":lead.status.value,"duplicate":False}
 
@@ -304,8 +343,11 @@ def create_lead(payload: LeadCreate, request: Request, principal: Principal = De
 def list_leads(principal: Principal = Depends(get_principal)):
     _require_permission(principal, "read")
     out=[]
-    for _, data, _generation in store.list_prefix(f"tenants/{principal.tenant_id}/leads"):
-        try: out.append(LeadRecord.model_validate(data))
+    for _, data, generation in store.list_prefix(f"tenants/{principal.tenant_id}/leads"):
+        try:
+            lead = LeadRecord.model_validate(data)
+            lead.generation = generation
+            out.append(lead)
         except Exception: continue
     return sorted([x.model_dump(mode="json") for x in out],key=lambda x:x["created_at"],reverse=True)
 
@@ -317,6 +359,119 @@ def get_lead(lead_id: str, principal: Principal = Depends(get_principal)):
         f=store.get(_key("quotes",principal.tenant_id,qid))
         if f: quotes.append(f[0])
     return {"lead":lead.model_dump(mode="json"),"quotes":quotes}
+
+@app.post(settings.api_prefix + "/leads/{lead_id}/review")
+def save_lead_review(
+    lead_id: str,
+    payload: LeadReviewSubmission,
+    principal: Principal = Depends(get_principal),
+):
+    _rate_limit(principal)
+    require_role(principal, Role.STAFF, Role.REVIEWER, Role.TENANT_ADMIN)
+    _require_permission(principal, "qualify_lead")
+    lead, generation = _load_lead(lead_id, principal)
+    if payload.expected_generation != generation:
+        raise HTTPException(409, "stale_generation")
+    if not lead.qualification:
+        raise HTTPException(422, "qualification_required")
+    if lead.quote_ids:
+        raise HTTPException(409, "qualification_locked_after_quote")
+
+    reviewed = lead.qualification.model_copy(deep=True)
+    editable_fields = (
+        "service_type", "location", "quantity", "area", "frequency", "requested_time"
+    )
+    corrected_fields = []
+    for field in editable_fields:
+        value = getattr(payload, field)
+        if value != getattr(lead.qualification, field):
+            corrected_fields.append(field)
+            reviewed.evidence.pop(field, None)
+        setattr(reviewed, field, value)
+
+    reviewed.model_used = "human_review"
+    reviewed.confidence_reason = "Values manually reviewed; the original AI confidence is unchanged."
+    required_fields = ("service_type", "location", "quantity", "requested_time")
+    reviewed.missing_fields = [
+        field for field in lead.qualification.missing_fields if field not in required_fields
+    ] + [field for field in required_fields if getattr(reviewed, field) is None]
+
+    lead.reviewed_qualification = reviewed
+    lead.reviewed_by = principal.actor_id
+    lead.reviewed_at = datetime.now(timezone.utc)
+    lead.reviewed_fields = corrected_fields
+    lead.policy_eligible = None
+    lead.policy_reasons = []
+    lead.status = (
+        LeadStatus.ESCALATED
+        if reviewed.injection_detected or reviewed.safety_flags
+        else LeadStatus.NEEDS_INFORMATION
+    )
+    lead.updated_at = lead.reviewed_at
+    lead.history.append({
+        "action": "lead.review_saved",
+        "actor_id": principal.actor_id,
+        "corrected_fields": corrected_fields,
+        "at": lead.reviewed_at.isoformat(),
+    })
+    _save_lead(lead, generation)
+    events.emit(
+        principal.tenant_id,
+        lead_id,
+        "lead.review_saved",
+        principal.actor_id,
+        content={"corrected_fields": corrected_fields},
+    )
+    return {"lead": lead.model_dump(mode="json"), "corrected_fields": corrected_fields}
+
+@app.post(settings.api_prefix + "/leads/{lead_id}/policy/evaluate")
+def evaluate_lead_policy(lead_id: str, principal: Principal = Depends(get_principal)):
+    _rate_limit(principal)
+    require_role(principal, Role.STAFF, Role.REVIEWER, Role.TENANT_ADMIN)
+    _require_permission(principal, "qualify_lead")
+    lead, generation = _load_lead(lead_id, principal)
+    if not lead.reviewed_qualification:
+        raise HTTPException(409, "human_review_required")
+
+    tenant = _tenant_settings(principal.tenant_id)
+    eligible, reasons = evaluate_qualification(
+        lead.reviewed_qualification, tenant, human_reviewed=True
+    )
+    lead.policy_eligible = eligible
+    lead.policy_reasons = reasons
+    lead.status = (
+        LeadStatus.QUALIFIED
+        if eligible
+        else (
+            LeadStatus.ESCALATED
+            if lead.reviewed_qualification.injection_detected
+            or lead.reviewed_qualification.safety_flags
+            else LeadStatus.NEEDS_INFORMATION
+        )
+    )
+    lead.updated_at = datetime.now(timezone.utc)
+    lead.history.append({
+        "action": "lead.policy_evaluated",
+        "actor_id": principal.actor_id,
+        "reasons": reasons,
+        "eligible": eligible,
+        "at": lead.updated_at.isoformat(),
+    })
+    _save_lead(lead, generation)
+    events.emit(
+        principal.tenant_id,
+        lead_id,
+        "lead.policy_evaluated",
+        principal.actor_id,
+        tenant.policy_version,
+        result="eligible" if eligible else "blocked",
+        content={"reasons": reasons},
+    )
+    return {
+        "eligible": eligible,
+        "reasons": reasons,
+        "lead": lead.model_dump(mode="json"),
+    }
 
 @app.post(settings.api_prefix + "/leads/{lead_id}/qualify", status_code=202)
 def qualify_lead(lead_id: str, background: BackgroundTasks, principal: Principal = Depends(get_principal)):
@@ -353,6 +508,14 @@ def qualify_lead(lead_id: str, background: BackgroundTasks, principal: Principal
                     return {"job_id": rec.id, "state": rec.state, "dispatch_mode": "existing_active_job"}
             except Exception:
                 continue
+    if lead.quote_ids:
+        raise HTTPException(409, "qualification_locked_after_quote")
+    lead.reviewed_qualification = None
+    lead.reviewed_by = None
+    lead.reviewed_at = None
+    lead.reviewed_fields = []
+    lead.policy_eligible = None
+    lead.policy_reasons = []
     lead.status=LeadStatus.QUALIFICATION_QUEUED; lead.updated_at=datetime.now(timezone.utc); _save_lead(lead,generation)
     job=JobRecord(id=new_id("job"),tenant_id=principal.tenant_id,lead_id=lead_id)
     store.put(_key("jobs",principal.tenant_id,job.id),job)
@@ -372,8 +535,11 @@ def draft_quote(lead_id: str, payload: QuoteCreate, principal: Principal = Depen
     require_role(principal,Role.STAFF,Role.REVIEWER,Role.TENANT_ADMIN); _require_permission(principal, "draft_quote")
     lead,generation=_load_lead(lead_id,principal); tenant=_tenant_settings(principal.tenant_id)
     if lead.status not in (LeadStatus.QUALIFIED,LeadStatus.QUOTE_DRAFT): raise HTTPException(422,"lead_not_qualified")
-    if not lead.qualification: raise HTTPException(422,"qualification_required")
-    ok,reasons=evaluate_qualification(lead.qualification,tenant)
+    qualification = lead.reviewed_qualification or lead.qualification
+    if not qualification: raise HTTPException(422,"qualification_required")
+    ok,reasons=evaluate_qualification(
+        qualification,tenant,human_reviewed=lead.reviewed_qualification is not None
+    )
     if not ok: raise HTTPException(422,{"quote_blocked_by_policy":reasons})
     try: quote=create_quote(principal.tenant_id,lead_id,payload,tenant)
     except PolicyError as exc: raise HTTPException(422,str(exc)) from exc
@@ -386,6 +552,7 @@ def draft_quote(lead_id: str, payload: QuoteCreate, principal: Principal = Depen
 @app.post(settings.api_prefix + "/quotes/{quote_id}/approve")
 def approve_quote(quote_id: str, payload: ApproveQuote, principal: Principal = Depends(get_principal)):
     require_role(principal,Role.REVIEWER,Role.TENANT_ADMIN); _require_permission(principal, "approve_quote")
+    if payload.reviewer_id != principal.actor_id: raise HTTPException(403,"reviewer_identity_mismatch")
     found=store.get(_key("quotes",principal.tenant_id,quote_id))
     if not found: raise HTTPException(404,"not_found")
     quote=QuoteRecord.model_validate(found[0])
@@ -407,7 +574,8 @@ def send_quote(quote_id: str, payload: SendQuote, principal: Principal = Depends
     if not found: raise HTTPException(404,"not_found")
     quote=QuoteRecord.model_validate(found[0])
     if quote.status != "approved" or not quote.approved_by or not quote.approved_at: raise HTTPException(409,"quote_not_approved")
-    if payload.approved_by != quote.approved_by: raise HTTPException(403,"approver_mismatch")
+    if payload.approved_by != quote.approved_by or principal.actor_id != quote.approved_by:
+        raise HTTPException(403,"approver_mismatch")
     lead_found=store.get(_key("leads",principal.tenant_id,quote.lead_id))
     if not lead_found: raise HTTPException(404,"not_found")
     lead=LeadRecord.model_validate(lead_found[0])

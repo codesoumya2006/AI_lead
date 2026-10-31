@@ -1,38 +1,37 @@
 # Implementation status and verification record
 
-## Local implementation included
+## Local implementation
 
-- [x] Typed API contracts and workflow states
-- [x] Tenant-scoped lead capture and hidden cross-tenant reads
-- [x] Consent requirement and idempotency key conflict detection
-- [x] Local JSON storage with generation checks; GCS adapter with object preconditions
-- [x] Structured qualification agent with Gemini JSON output and explicit deterministic fallback
-- [x] Conditional evidence-verification role
-- [x] Prompt-injection flags and human escalation path
-- [x] Deterministic qualification policy, catalogue pricing, VAT and exclusions checks
-- [x] Generation-aware quote approval and same-reviewer send gate
-- [x] Sandbox-only send record; no live message provider calls
-- [x] Append-only local/GCS audit event record, optional Cloud Tasks event flush, and BigQuery sink
-- [x] Optional Cloud Tasks dispatch; local background task only in local environment
-- [x] CSV export, tenant settings, configurable subscription tariff drafts, contract preview, two-person future-dated publishing, backend entitlements, usage/cost records, structured JSON logs and request IDs
-- [x] React + TypeScript responsive operations console with lead inbox, quote queue, AI guardrails, pricing view and settings
-- [x] Terraform starting point for GCS, BigQuery, Cloud Tasks, IAM, Artifact Registry, Secret Manager and gated Cloud Run services
-- [x] Backend workflow tests and CI definition
+- [x] Typed API contracts, tenant-scoped lead capture, consent and idempotency.
+- [x] Local JSON storage with generation checks and a GCS adapter with object preconditions.
+- [x] Gemini schema-constrained qualification, bounded HTTP 503 retries, a deterministic fallback, and separately identified model provenance.
+- [x] Evidence spans checked against both the original message and extracted values; unsupported values are removed.
+- [x] Conditional verification with an allowlist for safety concerns; local verification does not call Gemini redundantly.
+- [x] Human review persists corrected values and reviewer provenance separately from the original AI result.
+- [x] Deterministic policy evaluation is explicit and required before quote eligibility; failed qualification jobs escalate and remain ineligible.
+- [x] Requalification clears stale review state; requalification is locked after quote creation.
+- [x] Catalogue-based quote pricing, VAT, generation-aware approval, reviewer identity checks and sandbox-only send.
+- [x] Audit event coverage for lead, review, policy, quote, approval and sandbox-send transitions.
+- [x] Frontend API origin is centralized and configurable; failed API requests produce visible errors.
+- [x] The seven-day dashboard trend uses stored tenant lead dates rather than fabricated sample values.
+- [x] Local startup and API documentation updated in the README.
 
-## Verification performed in this build session
+## Verification performed
 
-- Backend test command: `python -m pytest -q`
-- Result: **22 passed** in the current environment.
-- Frontend source files passed TypeScript/JSX syntax transpilation. Dependency installation was attempted but timed out in the current environment, so no full type-check or frontend production build result is claimed.
-- Terraform CLI was not available in the current environment; no `terraform fmt`, `validate`, `plan` or apply result is claimed.
-- No GCP credentials, project, Gemini API key, WhatsApp provider credentials or CRM credentials were provided. Live integrations and cloud behavior are therefore not end-to-end verified.
+- Backend: `python -m pytest -q` — **54 passed**, one Starlette/AnyIO deprecation warning.
+- Backend lint: `ruff check app tests` — **passed**.
+- Frontend: `npm run build` — TypeScript and Vite production build **passed**; the generated JavaScript bundle exceeds Vite's 500 kB advisory threshold.
+- `git diff --check` — **passed**.
+- Real UI workflow: synthetic lead capture, qualification/fallback, human correction, deterministic policy evaluation, catalogue-priced quote, approval, simulated send and audit inspection — **passed** against an isolated temporary JSON store.
+- Controlled Gemini activity: a schema-constrained request succeeded in a controlled call; subsequent live UI calls observed provider 503/504 responses and exercised fallback. See the three `LEAD_TO_ORDER_*_REPORT.md` files for exact timings, intermediate failures and limitations.
+- Existing `backend/.local-data`, `.env`, tenant `northstar-test` and customer/lead/quote records were not used for the UI test. No migration or destructive storage change was performed.
 
-## Known release blockers
+## Not validated for production
 
-- Configure and test OIDC login/audience/tenant-role claims and production frontend auth.
-- Run frontend `npm install && npm run build` in a network-enabled environment and fix any compile issues.
-- Run Terraform formatting, validation and a reviewed plan against a dedicated non-production GCP project.
-- Verify Cloud Tasks OIDC invocation to the worker Cloud Run service and IAM/ingress configuration.
-- Configure and validate BigQuery ingestion/reconciliation and datasets.
-- Validate CRM selection, optional WhatsApp, privacy, retention, UK VAT and release approvals.
-- Replace the explicitly demo-only chart with measured analytics before presenting it as production data.
+- Production OIDC identity, issuer/audience, tenant/role claims and frontend sign-in.
+- GCP provisioning, Terraform validation/plan, Cloud Run IAM/ingress, Cloud Tasks OIDC, BigQuery schema/retention and cloud recovery.
+- CRM, WhatsApp and any live outbound communication.
+- Privacy, retention, VAT, SLO, budget, incident-response and release approvals.
+- Automated frontend component/browser tests are not configured; UI acceptance was performed manually in the browser.
+
+This is a local implementation candidate, not production approval. The supplied source specification remains authoritative; cloud deployment stays gated.

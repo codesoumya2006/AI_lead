@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.domain.schemas import LeadRecord, LeadStatus, TenantSettings
 from app.agents.qualification import (
     LeadQualificationAgent,
+    QualificationOutput,
     _estimate_cost,
 )
 from app.storage.local_store import LocalStore
@@ -48,12 +49,12 @@ H_NORTHSTAR = {
 
 def test_config_loading_and_rates():
     """Verify settings loads model, rates, and does not expose sensitive key in repr."""
-    assert settings.gemini_model in ("gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash")
-    assert settings.gemini_input_usd_per_million == 0.75
-    assert settings.gemini_output_usd_per_million == 3.75
+    assert settings.gemini_model in ("gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash")
+    assert settings.gemini_input_usd_per_million == 0.25
+    assert settings.gemini_output_usd_per_million == 1.50
     # Cost estimation calculation check
     usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
-    expected_cost = 0.75 + 3.75
+    expected_cost = 0.25 + 1.50
     assert _estimate_cost(usage) == round(expected_cost, 8)
 
 
@@ -64,6 +65,7 @@ def test_config_loading_and_rates():
 def test_supported_model_identifier():
     """Verify the configured model is among officially supported Google Gemini models."""
     supported_models = {
+        "gemini-3.1-flash-lite",
         "gemini-3.8-flash",
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
@@ -71,6 +73,22 @@ def test_supported_model_identifier():
         "gemini-1.5-pro",
     }
     assert settings.gemini_model in supported_models, f"Unsupported model: {settings.gemini_model}"
+
+
+def test_gemini_response_schema_avoids_unsupported_dynamic_objects():
+    """Gemini structured output does not support arbitrary additionalProperties."""
+    schema = QualificationOutput.model_json_schema()
+
+    def assert_no_additional_properties(value):
+        if isinstance(value, dict):
+            assert "additionalProperties" not in value
+            for child in value.values():
+                assert_no_additional_properties(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_no_additional_properties(child)
+
+    assert_no_additional_properties(schema)
 
 
 # =========================================================================
@@ -88,7 +106,7 @@ def test_mock_gemini_connectivity_and_cost_calculation(monkeypatch):
         "requested_time": None,
         "urgency": "normal",
         "missing_fields": [],
-        "evidence": {"service": "office cleaning", "location": "Kolkata"},
+        "evidence": {"service_type": "office cleaning", "location": "Kolkata"},
         "confidence": 0.95,
         "confidence_reason": "Clear facility office cleaning enquiry",
     }
@@ -104,6 +122,7 @@ def test_mock_gemini_connectivity_and_cost_calculation(monkeypatch):
     assert q.model_used == settings.gemini_model
     assert q.service_type == "commercial_cleaning"
     assert q.location == "Kolkata"
+    assert q.evidence == {"service_type": "office cleaning", "location": "Kolkata"}
     assert q.input_tokens == 450
     assert q.output_tokens == 120
     assert q.estimated_cost_usd is not None
